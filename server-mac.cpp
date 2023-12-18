@@ -46,15 +46,11 @@ static void set_fd_nb(int fd) {
     }
 }
 
-enum {
-    STATE_REQ = 0,
-    STATE_RES = 1,
-    STATE_END = 2,
-};
+enum class STATE { STATE_REQ, STATE_RES, STATE_END };
 
 struct Conn {
     int fd = -1;
-    uint32_t state = 0;
+    STATE state;
     // buffer for reading
     size_t read_buf_size = 0;
     uint8_t read_buf[4 + MAX_MSG_SIZE]{};
@@ -112,8 +108,8 @@ int main() {
         for (auto pair : fd2conn) {
             auto conn = pair.second;
             if (conn) {
-                int flag =
-                    (conn->state == STATE_REQ) ? EVFILT_READ : EVFILT_WRITE;
+                int flag = (conn->state == STATE::STATE_REQ) ? EVFILT_READ
+                                                             : EVFILT_WRITE;
                 EV_SET(&ev[index++], pair.first, flag,
                        EV_ADD | EV_ENABLE | EV_ONESHOT, 0, 0,
                        (void *)(intptr_t)pair.first);
@@ -139,7 +135,7 @@ int main() {
                 Conn *conn = fd2conn[fd];
                 if (conn) {
                     connection_io(conn);
-                    if (conn->state == STATE_END) {
+                    if (conn->state == STATE::STATE_END) {
                         close(conn->fd);
                         fd2conn.erase(conn->fd);
                         free(conn);
@@ -175,7 +171,7 @@ static int accept_new_conn(std::map<int, Conn *> &fd2conn, int fd) {
     }
 
     conn->fd = connfd;
-    conn->state = STATE_REQ;
+    conn->state = STATE::STATE_REQ;
     conn->read_buf_size = 0;
     conn->write_buf_sent = 0;
     conn->write_buf_size = 0;
@@ -189,9 +185,9 @@ static void state_req(Conn *conn);
 static void state_res(Conn *conn);
 
 static void connection_io(Conn *conn) {
-    if (conn->state == STATE_REQ) {
+    if (conn->state == STATE::STATE_REQ) {
         state_req(conn);
-    } else if (conn->state == STATE_RES) {
+    } else if (conn->state == STATE::STATE_RES) {
         state_res(conn);
     } else {
         assert(0);
@@ -223,7 +219,7 @@ static bool try_fill_buffer(Conn *conn) {
 
     if (rv < 0) {
         msg("read error");
-        conn->state = STATE_END;
+        conn->state = STATE::STATE_END;
         return false;
     }
 
@@ -233,7 +229,7 @@ static bool try_fill_buffer(Conn *conn) {
         } else {
             msg("EOF");
         }
-        conn->state = STATE_END;
+        conn->state = STATE::STATE_END;
         return false;
     }
 
@@ -244,7 +240,7 @@ static bool try_fill_buffer(Conn *conn) {
     while (try_one_request(conn)) {
     }
 
-    return (conn->state == STATE_REQ);
+    return (conn->state == STATE::STATE_REQ);
 }
 
 static uint32_t do_request(const uint8_t *req, uint32_t reqlen,
@@ -260,7 +256,7 @@ static bool try_one_request(Conn *conn) {
     memcpy(&len, &conn->read_buf[0], 4);
     if (len > MAX_MSG_SIZE) {
         msg("too long");
-        conn->state = STATE_END;
+        conn->state = STATE::STATE_END;
         return false;
     }
     if (4 + len > conn->read_buf_size) {
@@ -277,7 +273,7 @@ static bool try_one_request(Conn *conn) {
     uint32_t err = do_request(&conn->read_buf[4], len, &rescode,
                               &conn->write_buf[4 + 4], &wlen);
     if (err) {
-        conn->state = STATE_END;
+        conn->state = STATE::STATE_END;
         return false;
     }
     wlen += 4;
@@ -297,11 +293,11 @@ static bool try_one_request(Conn *conn) {
     conn->read_buf_size = remain;
 
     // change state.
-    conn->state = STATE_RES;
+    conn->state = STATE::STATE_RES;
     state_res(conn);
 
     // continue the outer loop if the request was fully processed.
-    return (conn->state == STATE_REQ);
+    return (conn->state == STATE::STATE_REQ);
 }
 
 static uint32_t parse_req(const uint8_t *data, size_t len,
@@ -337,11 +333,7 @@ static uint32_t parse_req(const uint8_t *data, size_t len,
     return 0;
 }
 
-enum {
-    RES_OK = 0,
-    RES_ERR = 1,
-    RES_NX = 2,
-};
+enum class RES { OK, ERR, NX };
 
 // data structure for the key space
 static struct {
@@ -378,15 +370,15 @@ static uint64_t str_hash(const uint8_t *data, size_t len) {
     return h;
 }
 
-static uint32_t do_get(std::vector<std::string> &cmd, uint8_t *res,
-                       uint32_t *reslen) {
+static RES do_get(std::vector<std::string> &cmd, uint8_t *res,
+                  uint32_t *reslen) {
     Entry key;
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
     HNode *node = hm_lookup((HMap *)&g_data.db, &key.node, &entry_eq);
     if (!node) {
-        return RES_NX;
+        return RES::NX;
     }
 
     const std::string &val = getStructPtr(node)->val;
@@ -394,10 +386,10 @@ static uint32_t do_get(std::vector<std::string> &cmd, uint8_t *res,
     assert(val.size() < MAX_MSG_SIZE);
     memcpy(res, val.data(), val.size());
     *reslen = (uint32_t)val.size();
-    return RES_OK;
+    return RES::OK;
 }
-static uint32_t do_set(std::vector<std::string> &cmd, uint8_t *res,
-                       uint32_t *reslen) {
+static RES do_set(std::vector<std::string> &cmd, uint8_t *res,
+                  uint32_t *reslen) {
     (void)res;
     (void)reslen;
 
@@ -415,11 +407,11 @@ static uint32_t do_set(std::vector<std::string> &cmd, uint8_t *res,
         ent->val.swap(cmd[2]);
         hm_insert(&g_data.db, &ent->node);
     }
-    return RES_OK;
+    return RES::OK;
 }
 
-static uint32_t do_del(std::vector<std::string> &cmd, uint8_t *res,
-                       uint32_t *reslen) {
+static RES do_del(std::vector<std::string> &cmd, uint8_t *res,
+                  uint32_t *reslen) {
     (void)res;
     (void)reslen;
 
@@ -431,7 +423,7 @@ static uint32_t do_del(std::vector<std::string> &cmd, uint8_t *res,
     if (node) {
         delete getStructPtr(node);
     }
-    return RES_OK;
+    return RES::OK;
 }
 
 static bool cmd_is(const std::string &word, const char *cmd) {
@@ -447,13 +439,13 @@ static uint32_t do_request(const uint8_t *req, uint32_t reqlen,
     }
 
     if (cmd.size() == 2 && cmd_is(cmd[0], "get")) {
-        *rescode = do_get(cmd, res, reslen);
+        *rescode = static_cast<uint32_t>(do_get(cmd, res, reslen));
     } else if (cmd.size() == 3 && cmd_is(cmd[0], "set")) {
-        *rescode = do_set(cmd, res, reslen);
+        *rescode = static_cast<uint32_t>(do_set(cmd, res, reslen));
     } else if (cmd.size() == 2 && cmd_is(cmd[0], "del")) {
-        *rescode = do_del(cmd, res, reslen);
+        *rescode = static_cast<uint32_t>(do_del(cmd, res, reslen));
     } else {
-        *rescode = RES_ERR;
+        *rescode = static_cast<uint32_t>(RES::ERR);
         const char *msg = "Unknown cmd";
         strcpy((char *)res, msg);
         *reslen = strlen(msg);
@@ -481,7 +473,7 @@ static bool try_flush_buffer(Conn *conn) {
     }
     if (rv < 0) {
         msg("write error");
-        conn->state = STATE_END;
+        conn->state = STATE::STATE_END;
         return false;
     }
 
@@ -490,7 +482,7 @@ static bool try_flush_buffer(Conn *conn) {
 
     if (conn->write_buf_sent == conn->write_buf_size) {
         // reponse was fully sent, change state back.
-        conn->state = STATE_REQ;
+        conn->state = STATE::STATE_REQ;
         conn->write_buf_sent = 0;
         conn->write_buf_size = 0;
         return false;

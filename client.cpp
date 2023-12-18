@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <netinet/in.h>
 #include <stdint.h>
@@ -16,6 +17,8 @@
 // static function can be only used in this file, so avoid same-name-issue
 static int32_t send_req(int fd, const std::vector<std::string> &cmd);
 static int32_t read_res(int fd);
+
+enum class RES { OK, ERR, NX };
 
 const unsigned MAX_MSG_SIZE = 4096;
 
@@ -189,7 +192,8 @@ static int32_t read_res(int fd) {
 
     memcpy(&rescode, &read_buf[4], 4);
 
-    printf("server says: [%u] %.*s\n", rescode, len - 4, &read_buf[8]);
+    std::cout << "server says: [" << rescode << "] " << std::setw(len - 4)
+              << std::setfill(' ') << std::right << &read_buf[8] << std::endl;
 
     return 0;
 }
