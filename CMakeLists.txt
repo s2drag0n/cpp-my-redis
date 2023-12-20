@@ -5,6 +5,11 @@ project(
   VERSION 1.0
   LANGUAGES CXX)
 
+if(NOT CMAKE_BUILD_TYPE)
+  add_definitions(-DDEBUG)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g") # 添加调试信息
+endif()
+
 add_executable(server server-mac.cpp hashtable.cpp)
 add_executable(client client.cpp)
 

@@ -28,4 +28,6 @@ void hm_insert(HMap *hmap, HNode *node);
 
 HNode *hm_pop(HMap *hmap, HNode *key, bool (*cmp)(HNode *, HNode *));
 
+size_t hm_size(HMap *hmap);
+
 void hm_destroy(HMap *hmap);
