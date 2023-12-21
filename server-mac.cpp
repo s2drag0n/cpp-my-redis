@@ -138,6 +138,22 @@ static struct {
     HMap db;
 } g_data;
 
+/* // the structure for the key */
+/* struct Entry { */
+/*     struct HNode node; */
+/*     std::string key; */
+/*     std::string val; */
+/* }; */
+/* Instead of making our data structure contain data, the hashtable node
+ * structure is embedded into the payload data. This is the standard way of
+ * creating generic data structures in C. */
+/**/
+/* Besides making the data structure fully generic, this technique also has the
+ * advantage of reducing unnecessary memory management. The structure node is
+ * not separately allocated but is part of the payload data, and the data
+ * structure code does not own the payload but merely organizes the data. This
+ * may be quite a new idea to you if you learned data structures from textbooks,
+ * which is probably using void * or C++ templates or even macros. */
 struct Entry {
     struct HNode node;
     std::string key;

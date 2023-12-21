@@ -1,3 +1,4 @@
+#pragma once
 // hashtable node, should be embedded int to the payload
 #include <cstddef>
 #include <cstdint>

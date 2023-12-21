@@ -12,8 +12,11 @@ endif()
 
 add_executable(server server-mac.cpp hashtable.cpp)
 add_executable(client client.cpp)
+add_executable(test_avl test_avl.cpp avl.cpp)
 
 target_compile_features(server PUBLIC cxx_std_11)
 set_target_properties(server PROPERTIES CXX_EXTENSIONS OFF)
 target_compile_features(client PUBLIC cxx_std_11)
 set_target_properties(client PROPERTIES CXX_EXTENSIONS OFF)
+target_compile_features(test_avl PUBLIC cxx_std_11)
+set_target_properties(test_avl PROPERTIES CXX_EXTENSIONS OFF)
