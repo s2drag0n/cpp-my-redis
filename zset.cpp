@@ -24,7 +24,7 @@ static uint32_t min(size_t lhs, size_t rhs) { return lhs < rhs ? lhs : rhs; }
 
 // compare by the (score, name) tuple
 static bool zless(AVLNode *lhs, double score, const char *name, size_t len) {
-    ZNode *zl = getStructPtr(lhs, &ZNode::tree);
+    ZNode *zl = container_of(lhs, ZNode, tree);
     if (zl->score != score) {
         return zl->score < score;
     }
@@ -36,7 +36,7 @@ static bool zless(AVLNode *lhs, double score, const char *name, size_t len) {
 }
 
 static bool zless(AVLNode *lhs, AVLNode *rhs) {
-    ZNode *zr = getStructPtr(rhs, &ZNode::tree);
+    ZNode *zr = container_of(rhs, ZNode, tree);
     return zless(lhs, zr->score, zr->name, zr->len);
 }
 
@@ -98,13 +98,13 @@ static bool hcmp(HNode *node, HNode *key) {
     if (node->hcode != key->hcode) {
         return false;
     }
-    ZNode *znode = getStructPtr(node, &ZNode::hmap);
-    Hkey *hkey = getStructPtr(key, &Hkey::node);
+    ZNode *znode = container_of(node, ZNode, hmap);
+    Hkey *hkey = container_of(key, Hkey, node);
 
     if (znode->len != hkey->len) {
         return false;
     }
-    return 0 == memcpy(znode->name, hkey->name, znode->len);
+    return 0 == memcmp(znode->name, hkey->name, znode->len);
 }
 
 // lookup by name
@@ -121,7 +121,7 @@ ZNode *zset_lookup(ZSet *zset, const char *name, size_t len) {
     if (!found) {
         return nullptr;
     }
-    return getStructPtr(found, &ZNode::hmap);
+    return container_of(found, ZNode, hmap);
 }
 
 // deletion by name
@@ -139,7 +139,7 @@ ZNode *zset_pop(ZSet *zset, const char *name, size_t len) {
         return nullptr;
     }
 
-    ZNode *node = getStructPtr(found, &ZNode::hmap);
+    ZNode *node = container_of(found, ZNode, hmap);
     zset->tree = avl_del(&node->tree);
     return node;
 }
@@ -162,7 +162,7 @@ ZNode *zset_query(ZSet *zset, double score, const char *name, size_t len,
         found = avl_offset(found, offset);
     }
 
-    return found ? getStructPtr(found, &ZNode::tree) : nullptr;
+    return found ? container_of(found, ZNode, tree) : nullptr;
 }
 
 void znode_del(ZNode *node) { free(node); }
@@ -173,7 +173,7 @@ static void tree_dispose(AVLNode *node) {
     }
     tree_dispose(node->left);
     tree_dispose(node->right);
-    znode_del(getStructPtr(node, &ZNode::tree));
+    znode_del(container_of(node, ZNode, tree));
 }
 void zset_dispose(ZSet *zset) {
     tree_dispose(zset->tree);

@@ -1,5 +1,4 @@
 #include "hashtable.h"
-#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdlib>

@@ -1,3 +1,4 @@
+#include "common.h"
 #include <arpa/inet.h>
 #include <cassert>
 #include <cerrno>
@@ -6,7 +7,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <iomanip>
 #include <iostream>
 #include <netinet/in.h>
 #include <string>
@@ -82,8 +82,6 @@ static int32_t send_req(int fd, const std::vector<std::string> &cmd) {
     return write_all(fd, wbuf, 4 + len);
 }
 
-enum class SER { NIL, ERR, STR, INT, ARR };
-
 static int32_t on_response(const uint8_t *data, size_t size) {
     /*
      * except a 4 bytes lenth of msg,
@@ -117,7 +115,7 @@ static int32_t on_response(const uint8_t *data, size_t size) {
 
     switch (static_cast<SER>(data[0])) {
     case SER::NIL:
-        std::cout << "(nil)" << std::endl;
+        printf("(nil)\n");
         return 1;
     case SER::ERR:
         if (size < 1 + 8) {
@@ -127,14 +125,14 @@ static int32_t on_response(const uint8_t *data, size_t size) {
         {
             int32_t code = 0;
             uint32_t len = 0;
+            memcpy(&len, &data[1 + 4], 4);
             memcpy(&code, &data[1], 4);
             if (size < 1 + 8 + len) {
                 msg("bad response");
                 return -1;
             }
 
-            std::cout << "(err) " << code << " " << std::setw(len)
-                      << std::setfill(' ') << &data[1 + 8] << std::endl;
+            printf("(err) %d %.*s\n", code, len, &data[1 + 8]);
             return 1 + 8 + len;
         }
     case SER::STR:
@@ -149,8 +147,7 @@ static int32_t on_response(const uint8_t *data, size_t size) {
                 msg("bad response");
                 return -1;
             }
-            std::cout << "(str) " << std::setw(len) << std::setfill(' ')
-                      << &data[1 + 4] << std::endl;
+            printf("(str) %.*s\n", len, &data[1 + 4]);
             return 1 + 4 + len;
         }
     case SER::INT:
@@ -161,7 +158,18 @@ static int32_t on_response(const uint8_t *data, size_t size) {
         {
             int64_t val = 0;
             memcpy(&val, &data[1], 8);
-            std::cout << "(int) " << val << std::endl;
+            printf("(int) %lld\n", val);
+            return 1 + 8;
+        }
+    case SER::DBL:
+        if (size < 1 + 8) {
+            msg("bad response");
+            return -1;
+        }
+        {
+            double val = 0;
+            memcpy(&val, &data[1], 8);
+            printf("(dbl) %g\n", val);
             return 1 + 8;
         }
     case SER::ARR:
@@ -172,7 +180,7 @@ static int32_t on_response(const uint8_t *data, size_t size) {
         {
             uint32_t len = 0;
             memcpy(&len, &data[1], 4);
-            std::cout << "(arr) len=" << len << std::endl;
+            printf("(arr) len=%u\n", len);
             size_t arr_bytes = 1 + 4;
             for (size_t i = 0; i < len; ++i) {
                 int32_t rv = on_response(&data[arr_bytes], size - arr_bytes);
@@ -181,7 +189,7 @@ static int32_t on_response(const uint8_t *data, size_t size) {
                 }
                 arr_bytes += (size_t)rv;
             }
-            std::cout << "(arr) end" << std::endl;
+            printf("(arr) end\n");
             return (int32_t)arr_bytes;
         }
     default:

@@ -1,10 +1,13 @@
+#include "common.h"
 #include "hashtable.h"
+#include "zset.h"
 #include <arpa/inet.h>
 #include <assert.h>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
@@ -138,6 +141,8 @@ static struct {
     HMap db;
 } g_data;
 
+enum class T { STR, ZSET };
+
 /* // the structure for the key */
 /* struct Entry { */
 /*     struct HNode node; */
@@ -158,37 +163,25 @@ struct Entry {
     struct HNode node;
     std::string key;
     std::string val;
+    T type = T::STR;
+    ZSet *zset = nullptr;
 };
 
-static struct Entry *getStructPtr(HNode *memberPtr) {
-    // 计算结构体中成员的偏移量
-    size_t offset = offsetof(struct Entry, node);
-
-    // 将成员指针减去偏移量，得到结构体指针
-    return (struct Entry *)((char *)memberPtr - offset);
-}
+// @brief: equal means keys equal
 static bool entry_eq(HNode *lhs, HNode *rhs) {
-    struct Entry *le = getStructPtr(lhs);
-    struct Entry *re = getStructPtr(rhs);
+    struct Entry *le = container_of(lhs, struct Entry, node);
+    struct Entry *re = container_of(rhs, struct Entry, node);
     return lhs->hcode == rhs->hcode and le->key == re->key;
 }
 
-static uint64_t str_hash(const uint8_t *data, size_t len) {
-    uint32_t h = 0x811C9DC5;
-    for (size_t i = 0; i < len; ++i) {
-        h = (h + data[i]) * 0x01000193;
-    }
-    return h;
-}
+enum class ERR { UNKNOWN = 1, TOOBIG, TYPE, ARG };
 
-enum class ERR { UNKNOWN, TOOBIG };
-
-enum class SER { NIL, ERR, STR, INT, ARR };
-
+// @brief: put SER::NIL into out
 static void out_nil(std::string &out) {
     out.push_back(static_cast<char>(SER::NIL));
 }
 
+// @brief: out = STR + strlen + str
 static void out_str(std::string &out, const std::string &val) {
     out.push_back(static_cast<char>(SER::STR));
     uint32_t len = (uint32_t)val.size();
@@ -196,12 +189,28 @@ static void out_str(std::string &out, const std::string &val) {
     out.append(val);
 }
 
+// @brief: out = STR + strlen + str
+static void out_str(std::string &out, const char *s, size_t size) {
+    out.push_back(static_cast<char>(SER::STR));
+    uint32_t len = (uint32_t)size;
+    out.append((char *)&len, 4);
+    out.append(s, len);
+}
+
+// @brief: out = INT + int64_t
 static void out_int(std::string &out, int64_t val) {
     out.push_back(static_cast<char>(SER::INT));
     out.append((char *)&val, 8);
 }
 
-static void out_err(std::string &out, int32_t code, const std::string &msg) {
+// @brief: out = DBL + double
+static void out_dbl(std::string &out, double val) {
+    out.push_back(static_cast<char>(SER::DBL));
+    out.append((char *)&val, 8);
+}
+
+// @brief: out = ERR + ERR::code + msglen + msg
+static void out_err(std::string &out, ERR code, const std::string &msg) {
     out.push_back(static_cast<char>(SER::ERR));
     out.append((char *)&code, 4);
     uint32_t len = (uint32_t)msg.size();
@@ -209,11 +218,19 @@ static void out_err(std::string &out, int32_t code, const std::string &msg) {
     out.append(msg);
 }
 
+// @brief: out = ARR + uint32_t n
 static void out_arr(std::string &out, uint32_t n) {
     out.push_back(static_cast<char>(SER::ARR));
     out.append((char *)&n, 4);
 }
 
+// @brief: check if out[0]==ARR, let out[1] = uint32_t n
+static void out_update_arr(std::string &out, uint32_t n) {
+    assert(out[0] == static_cast<char>(SER::ARR));
+    memcpy(&out[1], &n, 4);
+}
+
+// @brief: generate out by cmd, type is STR is good
 static void do_get(std::vector<std::string> &cmd, std::string &out) {
     Entry key;
     key.key.swap(cmd[1]);
@@ -224,10 +241,15 @@ static void do_get(std::vector<std::string> &cmd, std::string &out) {
         return out_nil(out);
     }
 
-    const std::string &val = getStructPtr(node)->val;
-    out_str(out, val);
+    Entry *ent = container_of(node, struct Entry, node);
+    if (ent->type != T::STR) {
+        return out_err(out, ERR::TYPE, "expect string type");
+    }
+
+    return out_str(out, ent->val);
 }
 
+// @brief: generate out by cmd, set this key value in hashtable not the AVLtree
 static void do_set(std::vector<std::string> &cmd, std::string &out) {
     Entry key;
     key.key.swap(cmd[1]);
@@ -235,7 +257,11 @@ static void do_set(std::vector<std::string> &cmd, std::string &out) {
 
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
     if (node) {
-        getStructPtr(node)->val.swap(cmd[2]);
+        Entry *ent = container_of(node, struct Entry, node);
+        if (ent->type != T::STR) {
+            return out_err(out, ERR::TYPE, "expect string type");
+        }
+        ent->val.swap(cmd[2]);
     } else {
         Entry *ent = new Entry();
         ent->key.swap(key.key);
@@ -246,6 +272,20 @@ static void do_set(std::vector<std::string> &cmd, std::string &out) {
     return out_nil(out);
 }
 
+// @brief: if type is ZSET, call zset_dispose, delete the AVLtree & hashtable
+static void entry_del(Entry *ent) {
+    switch (static_cast<T>(ent->type)) {
+    case T::ZSET:
+        zset_dispose(ent->zset);
+        delete ent->zset;
+        break;
+    case T::STR:
+        break;
+    }
+    delete ent;
+}
+
+// @brief:
 static void do_del(std::vector<std::string> &cmd, std::string &out) {
     Entry key;
     key.key.swap(cmd[1]);
@@ -253,7 +293,7 @@ static void do_del(std::vector<std::string> &cmd, std::string &out) {
 
     HNode *node = hm_pop(&g_data.db, &key.node, &entry_eq);
     if (node) {
-        delete getStructPtr(node);
+        entry_del(container_of(node, struct Entry, node));
     }
     return out_int(out, node ? 1 : 0);
 }
@@ -275,7 +315,7 @@ static void h_scan(HTab *tab, void (*f)(HNode *, void *), void *arg) {
 // find key by the node pointer
 static void cb_scan(HNode *node, void *arg) {
     std::string &out = *(std::string *)arg;
-    out_str(out, getStructPtr(node)->key);
+    out_str(out, container_of(node, struct Entry, node)->key);
 }
 
 static void do_keys(std::vector<std::string> &cmd, std::string &out) {
@@ -283,6 +323,144 @@ static void do_keys(std::vector<std::string> &cmd, std::string &out) {
     out_arr(out, (uint32_t)hm_size(&g_data.db));
     h_scan(&g_data.db.ht1, &cb_scan, &out);
     h_scan(&g_data.db.ht2, &cb_scan, &out);
+}
+
+static bool str2dbl(const std::string &s, double &out) {
+    char *endp = nullptr;
+    out = strtod(s.c_str(), &endp);
+    return endp == s.c_str() + s.size() && !isnan(out);
+}
+
+static bool str2int(const std::string &s, int64_t &out) {
+    char *endp = nullptr;
+    out = strtoll(s.c_str(), &endp, 10);
+    return endp == s.c_str() + s.size();
+}
+
+// zadd zset score name
+static void do_zadd(std::vector<std::string> &cmd, std::string &out) {
+    double score = 0;
+    if (!str2dbl(cmd[2], score)) {
+        return out_err(out, ERR::ARG, "expect fd number");
+    }
+
+    // lookup or create the zset, a database name
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    Entry *ent = nullptr;
+    if (!hnode) { // database does not exist
+        ent = new Entry();
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->type = T::ZSET;
+        ent->zset = new ZSet;
+        hm_insert(&g_data.db, &ent->node);
+    } else { // database exists
+        ent = container_of(hnode, struct Entry, node);
+        if (ent->type != T::ZSET) {
+            return out_err(out, ERR::TYPE, "expect zset");
+        }
+    }
+
+    // add or update the tuple
+    const std::string &name = cmd[3];
+    bool added = zset_add(ent->zset, name.data(), name.size(), score);
+    return out_int(out, (int64_t)added);
+}
+
+static bool expect_zset(std::string &out, std::string &s, Entry **ent) {
+    Entry key;
+    key.key.swap(s);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!hnode) {
+        out_nil(out);
+        return false;
+    }
+
+    *ent = container_of(hnode, struct Entry, node);
+    if ((*ent)->type != T::ZSET) {
+        out_err(out, ERR::TYPE, "expect zset");
+        return false;
+    }
+    return true;
+}
+
+// zrem zset name
+static void do_zrem(std::vector<std::string> &cmd, std::string &out) {
+    Entry *ent = nullptr;
+    if (!expect_zset(out, cmd[1], &ent)) {
+        return;
+    }
+
+    const std::string &name = cmd[2];
+    ZNode *znode = zset_pop(ent->zset, name.data(), name.size());
+    if (znode) {
+        znode_del(znode);
+    }
+    return out_int(out, znode ? 1 : 0);
+}
+
+// zscore zset name
+static void do_zscore(std::vector<std::string> &cmd, std::string &out) {
+    Entry *ent = nullptr;
+    if (!expect_zset(out, cmd[1], &ent)) {
+        return;
+    }
+
+    const std::string &name = cmd[2];
+    ZNode *znode = zset_lookup(ent->zset, name.data(), name.size());
+    return znode ? out_dbl(out, znode->score) : out_nil(out);
+}
+
+// zquery zset scorename offset limit
+static void do_zquery(std::vector<std::string> &cmd, std::string &out) {
+    // parse args
+    double score = 0;
+    if (!str2dbl(cmd[2], score)) {
+        return out_err(out, ERR::ARG, "expect fp number");
+    }
+    const std::string &name = cmd[3];
+    int64_t limit = 0;
+    int64_t offset = 0;
+    if (!str2int(cmd[4], offset)) {
+        return out_err(out, ERR::ARG, "expect int");
+    }
+    if (!str2int(cmd[5], limit)) {
+        return out_err(out, ERR::ARG, "expect int");
+    }
+
+    // get the zset
+    Entry *ent = nullptr;
+    if (!expect_zset(out, cmd[1], &ent)) {
+        if (static_cast<SER>(out[0]) == SER::NIL) {
+            out.clear();
+            out_arr(out, 0);
+        }
+        return;
+    }
+
+    // look up the tuple
+    if (limit <= 0) {
+        return out_arr(out, 0);
+    }
+
+    ZNode *znode =
+        zset_query(ent->zset, score, name.data(), name.size(), offset);
+
+    // output
+    out_arr(out, 0);
+    uint32_t n = 0;
+    while (znode && (int64_t)n < limit) {
+        out_str(out, znode->name, znode->len);
+        out_dbl(out, znode->score);
+        znode = container_of(avl_offset(&znode->tree, +1), struct ZNode, tree);
+        n += 2;
+    }
+    return out_update_arr(out, n);
 }
 
 static bool cmd_is(const std::string &word, const char *cmd) {
@@ -298,9 +476,17 @@ static void do_request(std::vector<std::string> &cmd, std::string &out) {
         do_set(cmd, out);
     } else if (cmd.size() == 2 and cmd_is(cmd[0], "del")) {
         do_del(cmd, out);
+    } else if (cmd.size() == 4 and cmd_is(cmd[0], "zadd")) {
+        do_zadd(cmd, out);
+    } else if (cmd.size() == 3 and cmd_is(cmd[0], "zrem")) {
+        do_zrem(cmd, out);
+    } else if (cmd.size() == 3 and cmd_is(cmd[0], "zscore")) {
+        do_zscore(cmd, out);
+    } else if (cmd.size() == 6 and cmd_is(cmd[0], "zquery")) {
+        do_zquery(cmd, out);
     } else {
         // cmd is not recognized
-        out_err(out, static_cast<uint32_t>(ERR::UNKNOWN), "Unknown cmd");
+        out_err(out, ERR::UNKNOWN, "Unknown cmd");
     }
 }
 
@@ -338,7 +524,7 @@ static bool try_one_request(Conn *conn) {
     // pack the response into the buffer
     if (4 + out.size() > MAX_MSG_SIZE) {
         out.clear();
-        out_err(out, static_cast<int32_t>(ERR::TOOBIG), "response is too big");
+        out_err(out, ERR::TOOBIG, "response is too big");
     }
     uint32_t wlen = (uint32_t)out.size();
     memcpy(&conn->wbuf[0], &wlen, 4);

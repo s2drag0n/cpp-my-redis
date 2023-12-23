@@ -3,14 +3,11 @@
 #include <cstddef>
 #include <cstdint>
 
-template <typename T, typename U, typename V>
-T *getStructPtr(U *memberPtr, V T::*member) {
-    // 计算结构体中成员的偏移量
-    size_t offset = offsetof(T, node);
-
-    // 将成员指针减去偏移量，得到结构体指针
-    return reinterpret_cast<T *>(reinterpret_cast<char *>(memberPtr) - offset);
-}
+#define container_of(ptr, type, member)                                        \
+    ({                                                                         \
+        const decltype(((type *)0)->member) *__mptr = (ptr);                   \
+        (type *)((char *)__mptr - offsetof(type, member));                     \
+    })
 
 inline uint64_t str_hash(const uint8_t *data, size_t len) {
     uint32_t h = 0x811C9DC5;
@@ -20,4 +17,4 @@ inline uint64_t str_hash(const uint8_t *data, size_t len) {
     return h;
 }
 
-enum class SER { NIL, ERR, STR, INT, ARR };
+enum class SER { NIL, ERR, STR, INT, DBL, ARR };
