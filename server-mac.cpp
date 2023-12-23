@@ -1,5 +1,6 @@
 #include "common.h"
 #include "hashtable.h"
+#include "list.h"
 #include "zset.h"
 #include <arpa/inet.h>
 #include <assert.h>
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fcntl.h>
 #include <iostream>
 #include <map>
@@ -41,6 +43,12 @@ static void die(const char *msg) {
     exit(EXIT_FAILURE);
 }
 
+static uint64_t get_monotonic_usec() {
+    timespec tv = {0, 0};
+    clock_gettime(CLOCK_MONOTONIC, &tv);
+    return uint64_t(tv.tv_sec) * 1000000 + tv.tv_nsec / 1000;
+}
+
 static void fd_set_nb(int fd) {
     errno = 0;
     int flag = fcntl(fd, F_GETFL);
@@ -66,7 +74,18 @@ struct Conn {
     size_t wbuf_size = 0;
     size_t wbuf_sent = 0;
     uint8_t wbuf[4 + MAX_MSG_SIZE]{};
+    // timer
+    DList idle_list;
+    uint64_t idle_start = 0;
 };
+
+// the data structure for the key space
+static struct {
+    HMap db;
+    // a map of all client connections, keyed by fd
+    std::map<int, Conn *> fd2conn;
+    DList idle_list;
+} g_data;
 
 static int accept_new_conn(std::map<int, Conn *> &fd2conn, int fd) {
     // accept
@@ -94,6 +113,8 @@ static int accept_new_conn(std::map<int, Conn *> &fd2conn, int fd) {
     conn->rbuf_size = 0;
     conn->wbuf_sent = 0;
     conn->wbuf_size = 0;
+    conn->idle_start = get_monotonic_usec();
+    dlist_insert_before(&g_data.idle_list, &conn->idle_list);
 
     // put conn in map
     fd2conn[connfd] = conn;
@@ -135,11 +156,6 @@ static uint32_t parse_req(const uint8_t *data, size_t len,
     }
     return 0;
 }
-
-// the data structure for the key space
-static struct {
-    HMap db;
-} g_data;
 
 enum class T { STR, ZSET };
 
@@ -629,6 +645,11 @@ static void state_res(Conn *conn) {
 }
 
 static void connection_io(Conn *conn) {
+
+    conn->idle_start = get_monotonic_usec();
+    dlist_detach(&conn->idle_list);
+    dlist_insert_before(&g_data.idle_list, &conn->idle_list);
+
     if (conn->state == STATE::REQ) {
         state_req(conn);
     } else if (conn->state == STATE::RES) {
@@ -638,7 +659,48 @@ static void connection_io(Conn *conn) {
     }
 }
 
+const uint64_t k_idle_timeout_ms = 5 * 1000;
+
+static uint32_t next_timer_ms() {
+    if (dlist_empty(&g_data.idle_list)) {
+        return 1000;
+    }
+
+    uint64_t now_us = get_monotonic_usec();
+    Conn *next = container_of(g_data.idle_list.next, Conn, idle_list);
+    uint64_t next_us = next->idle_start + k_idle_timeout_ms * 1000;
+    if (next_us <= now_us) {
+        return 0;
+    }
+    return (uint32_t)((next_us - now_us) / 1000);
+}
+
+static void conn_done(Conn *conn) {
+    g_data.fd2conn[conn->fd] = nullptr;
+    (void)close(conn->fd);
+    dlist_detach(&conn->idle_list);
+    g_data.fd2conn.erase(conn->fd);
+    free(conn);
+}
+
+static void process_timers() {
+    uint64_t now_us = get_monotonic_usec();
+    while (!dlist_empty(&g_data.idle_list)) {
+        Conn *next = container_of(g_data.idle_list.next, Conn, idle_list);
+        uint64_t next_us = next->idle_start + k_idle_timeout_ms * 1000;
+        if (next_us > now_us + 1000) {
+            break;
+        }
+
+        printf("removing idle xonnection: %d\n", next->fd);
+        conn_done(next);
+    }
+}
+
 int main() {
+
+    dlist_init(&g_data.idle_list);
+
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == -1) {
         die("socket create error");
@@ -664,9 +726,6 @@ int main() {
         die("bind error");
     }
 
-    // a map of all client connections, keyed by fd
-    std::map<int, Conn *> fd2conn;
-
     // set fd to be nonblocking
     fd_set_nb(fd);
 
@@ -683,7 +742,7 @@ int main() {
 
         // put all conn in kevent
         int index = 1;
-        for (auto &pair : fd2conn) {
+        for (auto &pair : g_data.fd2conn) {
             Conn *temp_conn = pair.second;
             if (temp_conn) {
                 short flag = (temp_conn->state == STATE::REQ) ? EVFILT_READ
@@ -696,8 +755,12 @@ int main() {
 
         struct kevent active_event[MAX_EVENTS]{};
 
+        timespec ts;
+        int time_ms = (int)next_timer_ms();
+        ts.tv_sec = time_ms / 1000;
+        ts.tv_nsec = time_ms % 1000 * 1000;
         // poll for active fds
-        rv = kevent(kfd, ev, index, active_event, MAX_EVENTS, nullptr);
+        rv = kevent(kfd, ev, index, active_event, MAX_EVENTS, &ts);
         if (rv < 0) {
             die("kevent error");
         }
@@ -706,19 +769,22 @@ int main() {
         for (int i = 0; i < rv; ++i) {
             if (*(int *)active_event[i].udata == fd) {
                 // listen fd
-                accept_new_conn(fd2conn, fd);
+                accept_new_conn(g_data.fd2conn, fd);
             } else {
                 // connections
                 int temp = *(int *)active_event[i].udata;
-                Conn *conn = fd2conn[temp];
+                Conn *conn = g_data.fd2conn[temp];
                 connection_io(conn);
                 if (conn->state == STATE::END) {
-                    close(temp);
-                    fd2conn.erase(temp);
-                    free(conn);
+                    /* close(temp); */
+                    /* g_data.fd2conn.erase(temp); */
+                    /* free(conn); */
+                    conn_done(conn);
                 }
             }
         }
+
+        process_timers();
     }
 
     return 0;
