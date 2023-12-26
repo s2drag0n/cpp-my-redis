@@ -1,5 +1,6 @@
 #include "common.h"
 #include "hashtable.h"
+#include "heap.h"
 #include "list.h"
 #include "zset.h"
 #include <arpa/inet.h>
@@ -85,6 +86,7 @@ static struct {
     // a map of all client connections, keyed by fd
     std::map<int, Conn *> fd2conn;
     DList idle_list;
+    std::vector<HeapItem> heap;
 } g_data;
 
 static int accept_new_conn(std::map<int, Conn *> &fd2conn, int fd) {
@@ -181,6 +183,7 @@ struct Entry {
     std::string val;
     T type = T::STR;
     ZSet *zset = nullptr;
+    size_t heap_idx = -1;
 };
 
 // @brief: equal means keys equal
@@ -288,6 +291,31 @@ static void do_set(std::vector<std::string> &cmd, std::string &out) {
     return out_nil(out);
 }
 
+static void entry_set_ttl(Entry *ent, int64_t ttl_ms) {
+    if (ttl_ms < 0 and ent->heap_idx != (size_t)-1) {
+        // erase an item from thje heap
+        // by replacing it with the last item in the array
+        size_t pos = ent->heap_idx;
+        g_data.heap[pos] = g_data.heap.back();
+        g_data.heap.pop_back();
+        if (pos < g_data.heap.size()) {
+            heap_update(g_data.heap.data(), pos, g_data.heap.size());
+        }
+        ent->heap_idx = -1;
+    } else if (ttl_ms >= 0) {
+        size_t pos = ent->heap_idx;
+        if (pos == (size_t)-1) {
+            // add an new item to the heap
+            HeapItem item;
+            item.ref = &ent->heap_idx;
+            g_data.heap.emplace_back(item);
+            pos = g_data.heap.size() - 1;
+        }
+        g_data.heap[pos].val = get_monotonic_usec() + (uint64_t)ttl_ms * 1000;
+        heap_update(g_data.heap.data(), pos, g_data.heap.size());
+    }
+}
+
 // @brief: if type is ZSET, call zset_dispose, delete the AVLtree & hashtable
 static void entry_del(Entry *ent) {
     switch (static_cast<T>(ent->type)) {
@@ -298,6 +326,7 @@ static void entry_del(Entry *ent) {
     case T::STR:
         break;
     }
+    entry_set_ttl(ent, -1);
     delete ent;
 }
 
@@ -477,6 +506,44 @@ static void do_zquery(std::vector<std::string> &cmd, std::string &out) {
         n += 2;
     }
     return out_update_arr(out, n);
+}
+
+static void do_expire(std::vector<std::string> &cmd, std::string &out) {
+    int64_t ttl_ms = 0;
+    if (!str2int(cmd[2], ttl_ms)) {
+        return out_err(out, ERR::ARG, "expect int64");
+    }
+
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (node) {
+        Entry *ent = container_of(node, Entry, node);
+        entry_set_ttl(ent, ttl_ms);
+    }
+    return out_int(out, node ? 1 : 0);
+}
+
+static void do_ttl(std::vector<std::string> &cmd, std::string &out) {
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node) {
+        return out_int(out, -2);
+    }
+
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->heap_idx == (size_t)-1) {
+        return out_int(out, -1);
+    }
+
+    uint64_t expire_at = g_data.heap[ent->heap_idx].val;
+    uint64_t now_us = get_monotonic_usec();
+    return out_int(out, expire_at > now_us ? (expire_at - now_us) / 1000 : 0);
 }
 
 static bool cmd_is(const std::string &word, const char *cmd) {
@@ -662,16 +729,27 @@ static void connection_io(Conn *conn) {
 const uint64_t k_idle_timeout_ms = 5 * 1000;
 
 static uint32_t next_timer_ms() {
-    if (dlist_empty(&g_data.idle_list)) {
-        return 1000;
+    uint64_t now_us = get_monotonic_usec();
+    uint64_t next_us = (uint64_t)-1;
+    // idel timers
+    if (!dlist_empty(&g_data.idle_list)) {
+        Conn *next = container_of(g_data.idle_list.next, Conn, idle_list);
+        next_us = next->idle_start + k_idle_timeout_ms * 1000;
     }
 
-    uint64_t now_us = get_monotonic_usec();
-    Conn *next = container_of(g_data.idle_list.next, Conn, idle_list);
-    uint64_t next_us = next->idle_start + k_idle_timeout_ms * 1000;
-    if (next_us <= now_us) {
+    // ttl timers
+    if (!g_data.heap.empty() and g_data.heap[0].val < next_us) {
+        next_us = g_data.heap[0].val;
+    }
+
+    if (next_us == (uint64_t)-1) {
+        return 10000;
+    }
+
+    if (next_us >= now_us) {
         return 0;
     }
+
     return (uint32_t)((next_us - now_us) / 1000);
 }
 
@@ -683,8 +761,10 @@ static void conn_done(Conn *conn) {
     free(conn);
 }
 
+static bool hnode_same(HNode *lhs, HNode *rhs) { return lhs = rhs; }
+
 static void process_timers() {
-    uint64_t now_us = get_monotonic_usec();
+    uint64_t now_us = get_monotonic_usec() + 1000;
     while (!dlist_empty(&g_data.idle_list)) {
         Conn *next = container_of(g_data.idle_list.next, Conn, idle_list);
         uint64_t next_us = next->idle_start + k_idle_timeout_ms * 1000;
@@ -694,6 +774,18 @@ static void process_timers() {
 
         printf("removing idle xonnection: %d\n", next->fd);
         conn_done(next);
+    }
+
+    const size_t k_max_works = 2000;
+    size_t nworks = 0;
+    while (!g_data.heap.empty() and g_data.heap[0].val < now_us) {
+        Entry *ent = container_of(g_data.heap[0].ref, Entry, heap_idx);
+        HNode *node = hm_pop(&g_data.db, &ent->node, &hnode_same);
+        assert(node == &ent->node);
+        entry_del(ent);
+        if (nworks++ >= k_max_works) {
+            break;
+        }
     }
 }
 
