@@ -106,7 +106,7 @@
 
 用于查询key对应的value。是选新建一个Entry，将其的key设置为待查询的key，将其hcode设置为待查询的hcode（hcode仅仅和key有关）。
 
-调用hm_lookup去哈希表g_data中的db中去查询上面新建的Entry。//TODO
+调用[hm_lookup](#hm_lookup)去哈希表g_data中的db中去查询上面新建的Entry.
 
 - 如果没找到，返回nil
 - 如果查询到的node对应的Entry中的类型不是STR，则返回一个错误，错误信息为expect string type
@@ -116,17 +116,95 @@
 
 同样新建一个同key和hcode的Entry。查询这个Entry，如果找到了先判断类型是否为STR，然后将其value设置为给定的value。
 
-如果还不存在，则new一个Entry，设置对应的key、hcode、val，调用hm_insert将其插入到g_data的db中去。//TODO
+如果还不存在，则new一个Entry，设置对应的key、hcode、val，调用[hm_insert](#hm_insert)将其插入到g_data的db中去。
 
 ##### do_del
 
-同样新建Entry，调用hm_pop将其从db中删除。如果删除时返回非空，也就是删除成功，则调用entry_del将此Entry删除。//TODO
+同样新建Entry，调用[hm_pop](#hm_pop)将其从db中删除。如果删除时返回非空，也就是删除成功，则调用[entry_del](#entry_del)将此Entry删除。//TODO
 
 ##### do_zadd
 
+首先检查请求中的score是否为double，不是则返回error。
+
+新建一个人key和hcode的Entry，从db中查找此Entry。
+
+如果没找到，就新建一个Entry来设置同key、hcode，type=ZSET，ent指向一个新建的Zset（包含一个平衡二叉树和一个哈希表）。并将该Entry的node插入到db统一管理。
+
+如果找到了，检查对应Entry的类型是否为ZSET，不是则返回错误。
+
+根据命令中的name，将该name和score插入到该新建的或者找到的zset中，同时插入hashmap和avltree中。
+
 ##### do_zrem
+
+找到key对应的hnode对应的Entry，也就是找到该数据库入口。根据name从zset的avltree和hashmap中删除节点，并del内存。
 
 ##### do_zscore
 
+根据key（数据库名）找到数据库对应的Entry，在其中的zset中根据name查询znode，返回znode中的score。
+
 ##### do_zquery
 
+查询该数据库偏移限制。
+
+score的double类型检查、limit和offset的int类型检查。
+
+通过key得到zset。
+
+使用zset_query查找到一个znode？？？
+
+如果找到则循环输出范围内的name和score。也就是范围查找？
+
+### HashMap操作
+
+##### <span id="hm_lookup">hm_lookup</span>
+
+从链式哈希表中寻找目标节点，并返回目标指向存储目标节点地址的指针。
+
+##### <span id="hm_insert">hm_insert</span>
+
+根据hashcode找到应该放置的位置，然后插入当前位置代表链表的头。
+
+##### <span id="hm_pop">hm_pop</span>
+
+根据传入的指针，将该哈希节点删除。
+
+### Entry操作
+```cpp
+struct Entry {
+    struct HNode node;
+    std::string key;
+    std::string val;
+    T type = T::STR;
+    ZSet *zset = nullptr;
+    size_t heap_idx = -1;
+};
+```
+##### <span id="entry_del">entry_del</span>
+
+如果entry的类型是ZSET，调用zset_dispose函数，并将该ent中的zset删除。
+
+设置entry的ttl为-1，删除该ent。
+
+### Zset操作
+```cpp
+struct ZSet {
+    AVLNode *tree = nullptr;
+    HMap hmap;
+};
+struct ZNode {
+    AVLNode tree;
+    HNode hmap;
+    double score = 0;
+    size_t len = 0;
+    char name[0];
+};
+```
+# 总结
+
+数据库名使用hsahmap保存，存在g_data的db中。通过数据库名可以找到其对应的Entry，里面存放着数据库对应的zset。而每个zset是通过维护一个HashMap和一个avltree来保存name和score键值对的。其中键值对存放在znode中，其中还有用来结构化的hnode和avlnode。
+
+上面说的数据库名其实是一个有序集合名，所以score是double类型。而g_data的db本来任务是存放不同种类的键值对，如int、str、arr等。
+
+而每一条记录都应该设置ttl，所以需要为db中的每一个entry设置一个ttl时间，所以才有设置ttl和获取ttl命令。超时时间使用heap来维护。
+
+可动态扩容哈希表、循环链表、平衡二叉树、堆。

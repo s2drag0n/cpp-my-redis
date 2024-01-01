@@ -134,7 +134,7 @@ ZNode *zset_pop(ZSet *zset, const char *name, size_t len) {
     key.node.hcode = str_hash((uint8_t *)name, len);
     key.name = name;
     key.len = len;
-    HNode *found = hm_lookup(&zset->hmap, &key.node, &hcmp);
+    HNode *found = hm_pop(&zset->hmap, &key.node, &hcmp);
     if (!found) {
         return nullptr;
     }
