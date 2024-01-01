@@ -36,20 +36,24 @@ const unsigned MAX_MSG_NUM = 1024;
 
 const unsigned MAX_EVENTS = 1024;
 
+// cerr message
 static void msg(const char *msg) { std::cerr << msg << std::endl; }
 
+// cerr message and exit
 static void die(const char *msg) {
     int err = errno;
     std::cerr << "[" << err << "] " << msg << std::endl;
     exit(EXIT_FAILURE);
 }
 
+// get time now
 static uint64_t get_monotonic_usec() {
     timespec tv = {0, 0};
     clock_gettime(CLOCK_MONOTONIC, &tv);
     return uint64_t(tv.tv_sec) * 1000000 + tv.tv_nsec / 1000;
 }
 
+// set fd to be non-blocking
 static void fd_set_nb(int fd) {
     errno = 0;
     int flag = fcntl(fd, F_GETFL);
@@ -63,8 +67,10 @@ static void fd_set_nb(int fd) {
     }
 }
 
+// connection state
 enum class STATE { REQ, RES, END };
 
+// connection struct
 struct Conn {
     int fd = -1;
     STATE state;
