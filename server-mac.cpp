@@ -2,6 +2,7 @@
 #include "hashtable.h"
 #include "heap.h"
 #include "list.h"
+#include "threadpool.h"
 #include "zset.h"
 #include <arpa/inet.h>
 #include <assert.h>
@@ -93,6 +94,8 @@ static struct {
     std::map<int, Conn *> fd2conn;
     DList idle_list;
     std::vector<HeapItem> heap;
+    // thread pool
+    ThreadPool tp;
 } g_data;
 
 static int accept_new_conn(std::map<int, Conn *> &fd2conn, int fd) {
@@ -323,7 +326,7 @@ static void entry_set_ttl(Entry *ent, int64_t ttl_ms) {
 }
 
 // @brief: if type is ZSET, call zset_dispose, delete the AVLtree & hashtable
-static void entry_del(Entry *ent) {
+static void entry_destory(Entry *ent) {
     switch (static_cast<T>(ent->type)) {
     case T::ZSET:
         zset_dispose(ent->zset);
@@ -336,6 +339,27 @@ static void entry_del(Entry *ent) {
     delete ent;
 }
 
+static void entry_del_async(void *arg) { entry_destory((Entry *)arg); }
+
+static void entry_del(Entry *ent) {
+    entry_set_ttl(ent, -1);
+
+    const size_t k_large_container_size = 10000;
+    bool too_big = false;
+    switch (static_cast<T>(ent->type)) {
+    case T::ZSET:
+        too_big = hm_size(&ent->zset->hmap) > k_large_container_size;
+        break;
+    case T::STR:
+        break;
+    }
+
+    if (too_big) {
+        thread_pool_queue(&g_data.tp, &entry_del_async, ent);
+    } else {
+        entry_destory(ent);
+    }
+}
 // @brief:
 static void do_del(std::vector<std::string> &cmd, std::string &out) {
     Entry key;
@@ -565,6 +589,10 @@ static void do_request(std::vector<std::string> &cmd, std::string &out) {
         do_set(cmd, out);
     } else if (cmd.size() == 2 and cmd_is(cmd[0], "del")) {
         do_del(cmd, out);
+    } else if (cmd.size() == 3 && cmd_is(cmd[0], "pexpire")) {
+        do_expire(cmd, out);
+    } else if (cmd.size() == 2 && cmd_is(cmd[0], "pttl")) {
+        do_ttl(cmd, out);
     } else if (cmd.size() == 4 and cmd_is(cmd[0], "zadd")) {
         do_zadd(cmd, out);
     } else if (cmd.size() == 3 and cmd_is(cmd[0], "zrem")) {
@@ -798,6 +826,7 @@ static void process_timers() {
 int main() {
 
     dlist_init(&g_data.idle_list);
+    thread_pool_init(&g_data.tp, 4);
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == -1) {
