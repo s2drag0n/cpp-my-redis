@@ -1,4 +1,3 @@
-# 学习自[build-your-own-redis](https://build-your-own.org/redis/)
 
 ```
 -------------------------------------------------------------------------------
@@ -13,6 +12,7 @@ CMake                            1              4              0             16
 SUM:                            19            411            313           1976
 -------------------------------------------------------------------------------
 ```
+# FROM[build-your-own-redis](https://build-your-own.org/redis/)
 
 # SERVER-ANALYSIS
 
